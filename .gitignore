@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+venv/
+output/
+
+# Generated output
+generated_site/
+figma_images/
+figma_site.zip
