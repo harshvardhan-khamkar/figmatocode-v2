@@ -38,35 +38,43 @@ def parse_fills(node, fills):
     if not fills or not isinstance(fills, list):
         fills = []
 
+    # Prefer image fills when present, even if a SOLID fill exists.
     for f in fills:
         if not f or f.get("visible") is False:
             continue
+        if f.get("type") in ["IMAGE", "VIDEO"]:
+            return {
+                "image": True,
+                "imageRef": f.get("imageRef"),
+                "imageScale": f.get("scaleMode")
+            }
 
+    for f in fills:
+        if not f or f.get("visible") is False:
+            continue
         if f.get("type") == "SOLID":
             return {
                 "bg": color_to_hex(f.get("color")),
                 "opacity": f.get("opacity", 1)
             }
 
-        if f.get("type") in ["IMAGE", "VIDEO"]:
-            return {
-                "image": True,
-                "imageRef": f.get("imageRef")
-            }
-
     # Fallback to background fills (frames)
-    for bg in node.get("background") or []:
+    backgrounds = node.get("backgrounds")
+    if backgrounds is None:
+        backgrounds = node.get("background")
+    for bg in backgrounds or []:
         if not bg or bg.get("visible") is False:
             continue
+        if bg.get("type") in ["IMAGE", "VIDEO"]:
+            return {
+                "image": True,
+                "imageRef": bg.get("imageRef"),
+                "imageScale": bg.get("scaleMode")
+            }
         if bg.get("type") == "SOLID":
             return {
                 "bg": color_to_hex(bg.get("color")),
                 "opacity": bg.get("opacity", 1)
-            }
-        if bg.get("type") in ["IMAGE", "VIDEO"]:
-            return {
-                "image": True,
-                "imageRef": bg.get("imageRef")
             }
 
     return {}

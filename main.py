@@ -6,6 +6,7 @@ import os
 import zipfile
 import shutil
 import traceback
+import re
 
 from models import ConvertRequest
 from Services.figma_service import get_figma_file
@@ -16,6 +17,7 @@ from storedb import save_figma_json, update_parsed_layout, get_cached_figma
 from Services.image import build_image_ref_map, extract_file_key
 from Services.image import inject_images_into_layout
 from storedb import get_cached_images
+from Services.ir_normalizer import normalize_layout
 
 app = FastAPI()
 
@@ -30,9 +32,166 @@ app.add_middleware(
 def copy_templates(out_dir):
     shutil.copytree("templates", out_dir, dirs_exist_ok=True)
 
+def _safe_component_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "", name)
+    if not cleaned:
+        return "Page"
+    if not cleaned[0].isalpha():
+        return "Page" + cleaned
+    return cleaned
 
-def export_images_to_assets(file_key, out_dir):
-    assets_dir = os.path.join(out_dir, "assets")
+def _collect_fonts_from_layout(layout: dict) -> dict:
+    families = {}
+
+    def _walk(node):
+        if not node:
+            return
+        style = node.get("style") or {}
+        family = style.get("family")
+        weight = style.get("weight")
+        if family:
+            if family not in families:
+                families[family] = set()
+            if isinstance(weight, (int, float)):
+                families[family].add(int(weight))
+        for child in node.get("children") or []:
+            _walk(child)
+
+    for page in layout.get("pages") or []:
+        for screen in page.get("screens") or []:
+            for node in screen.get("tree") or []:
+                _walk(node)
+
+    return families
+
+def _build_google_fonts_import(families: dict) -> str | None:
+    if not families:
+        return None
+    parts = []
+    for family, weights in families.items():
+        fam = family.replace(" ", "+")
+        if weights:
+            w = ";".join(str(w) for w in sorted(weights))
+            parts.append(f"family={fam}:wght@{w}")
+        else:
+            parts.append(f"family={fam}")
+    if not parts:
+        return None
+    return f'@import url("https://fonts.googleapis.com/css2?{"&".join(parts)}&display=swap");'
+
+def _build_font_utilities_css(families: dict) -> str | None:
+    if not families:
+        return None
+    lines = []
+    default_family = None
+    for family in families.keys():
+        if not default_family:
+            default_family = family
+        slug = re.sub(r"[^a-z0-9]", "", family.lower())
+        if not slug:
+            continue
+        lines.append(f".font-{slug} {{ font-family: '{family}', sans-serif; }}")
+    if not lines:
+        return None
+    base = ""
+    if default_family:
+        base = (
+            "@layer base {\n"
+            f"  body {{ font-family: '{default_family}', sans-serif; }}\n"
+            "}\n"
+        )
+    utilities = "@layer utilities {\n  " + "\n  ".join(lines) + "\n}\n"
+    return base + utilities
+
+def add_font_imports_to_index_css(layout: dict, out_dir: str):
+    css_path = os.path.join(out_dir, "src", "index.css")
+    if not os.path.exists(css_path):
+        return
+    families = _collect_fonts_from_layout(layout)
+    font_import = _build_google_fonts_import(families)
+    if not font_import:
+        return
+    font_utils = _build_font_utilities_css(families)
+    with open(css_path, "r", encoding="utf-8") as f:
+        css = f.read()
+    if "fonts.googleapis.com/css2" in css:
+        return
+    if font_utils and "font-" not in css:
+        css = font_import + "\n" + font_utils + "\n" + css
+    else:
+        css = font_import + "\n" + css
+    with open(css_path, "w", encoding="utf-8") as f:
+        f.write(css)
+
+def ensure_react_entry(ui_files: dict) -> dict:
+    if any(p.endswith("src/App.jsx") for p in ui_files.keys()):
+        return ui_files
+
+    pages = sorted(
+        p for p in ui_files.keys()
+        if p.startswith("src/pages/") and p.endswith(".jsx")
+    )
+
+    if pages:
+        imports = []
+        routes = []
+        first = True
+        for p in pages:
+            base = os.path.basename(p).replace(".jsx", "")
+            comp = _safe_component_name(base)
+            rel = "./" + p.replace("src/", "")
+            imports.append(f'import {comp} from "{rel}";')
+            if first:
+                routes.append(f'        <Route path="/" element={{<{comp} />}} />')
+                first = False
+            slug = base.strip().lower().replace(" ", "-")
+            if slug:
+                routes.append(f'        <Route path="/{slug}" element={{<{comp} />}} />')
+
+        app = "\n".join([
+            'import { BrowserRouter, Routes, Route } from "react-router-dom";',
+            *imports,
+            "",
+            "export default function App() {",
+            "  return (",
+            "    <BrowserRouter>",
+            "      <Routes>",
+            *routes,
+            "      </Routes>",
+            "    </BrowserRouter>",
+            "  );",
+            "}",
+            "",
+        ])
+        ui_files["src/App.jsx"] = app
+        return ui_files
+
+    # Fallback: render the first component file if no pages were generated.
+    first_file = next((p for p in ui_files.keys() if p.startswith("src/") and p.endswith(".jsx")), None)
+    if first_file and not first_file.endswith("src/App.jsx"):
+        base = os.path.basename(first_file).replace(".jsx", "")
+        comp = _safe_component_name(base)
+        rel = "./" + first_file.replace("src/", "")
+        app = "\n".join([
+            f'import {comp} from "{rel}";',
+            "",
+            "export default function App() {",
+            f"  return <{comp} />;",
+            "}",
+            "",
+        ])
+        ui_files["src/App.jsx"] = app
+        return ui_files
+
+    ui_files["src/App.jsx"] = "export default function App() { return <div>App is running</div>; }\n"
+    return ui_files
+
+
+def export_images_to_assets(file_key, out_dir, public_assets=False):
+    if public_assets:
+        assets_dir = os.path.join(out_dir, "public", "assets")
+    else:
+        assets_dir = os.path.join(out_dir, "assets")
     os.makedirs(assets_dir, exist_ok=True)
 
     docs = get_cached_images(file_key)
@@ -65,7 +224,8 @@ def convert_design(req: ConvertRequest):
 
         # ------- Build image ref map ----------
         file_key = extract_file_key(figma_url)
-        image_map = build_image_ref_map(figma_json, file_key)
+        image_base = "/assets" if framework == "react" else "assets"
+        image_map = build_image_ref_map(figma_json, file_key, base_path=image_base)
 
         #----------------------------------------
 
@@ -75,6 +235,7 @@ def convert_design(req: ConvertRequest):
 
         # -------- Inject images --------
         inject_images_into_layout(layout, image_map)
+        layout = normalize_layout(layout)
 
         # -------- 3. Output folder --------
         out_dir = "generated_site"
@@ -101,7 +262,7 @@ def convert_design(req: ConvertRequest):
                     }
 
                     time.sleep(4)
-                    code = generate_code(screen_layout, framework)
+                    code = generate_code(screen_layout, framework, route_layout=layout)
 
                     with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as f:
                         f.write(code)
@@ -115,6 +276,7 @@ def convert_design(req: ConvertRequest):
 
             # 2. AI generates ONLY UI files
             ui_files = generate_code(layout, framework)
+            ui_files = ensure_react_entry(ui_files)
 
             # 3. Inject AI files
             for path, content in ui_files.items():
@@ -123,6 +285,7 @@ def convert_design(req: ConvertRequest):
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 with open(full, "w", encoding="utf-8") as f:
                      f.write(content)
+            add_font_imports_to_index_css(layout, out_dir)
 
         else:
             raise Exception("Invalid framework")
@@ -130,7 +293,7 @@ def convert_design(req: ConvertRequest):
 
 
         # ------- Export cached images to assets----------
-        export_images_to_assets(file_key, out_dir)
+        export_images_to_assets(file_key, out_dir, public_assets=(framework == "react"))
 
 
         # -------- 4. Zip --------
