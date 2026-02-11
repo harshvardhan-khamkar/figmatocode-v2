@@ -27,6 +27,7 @@ def _normalize_style(style: dict) -> dict:
         "imageRef",
         "imageUrl",
         "imageScale",
+        "clips",
         "border",
         "radius",
         "effects",

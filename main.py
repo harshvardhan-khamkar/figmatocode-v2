@@ -7,6 +7,9 @@ import zipfile
 import shutil
 import traceback
 import re
+import base64
+import hashlib
+import urllib.parse
 
 from models import ConvertRequest
 from Services.figma_service import get_figma_file
@@ -201,6 +204,112 @@ def export_images_to_assets(file_key, out_dir, public_assets=False):
         with open(path, "wb") as f:
             f.write(d["data"])
 
+def _extract_data_uris(html: str, out_dir: str, public_assets: bool = False) -> str:
+    if not html:
+        return html
+
+    assets_dir = os.path.join(out_dir, "public", "assets") if public_assets else os.path.join(out_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    url_prefix = "/assets" if public_assets else "assets"
+
+    def _write_asset(raw: bytes, mime: str) -> str:
+        ext = "bin"
+        if "svg" in mime:
+            ext = "svg"
+        elif "png" in mime:
+            ext = "png"
+        elif "jpeg" in mime or "jpg" in mime:
+            ext = "jpg"
+        elif "webp" in mime:
+            ext = "webp"
+        name = hashlib.sha1(raw).hexdigest()[:16]
+        filename = f"inline-{name}.{ext}"
+        path = os.path.join(assets_dir, filename)
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(raw)
+        return f"{url_prefix}/{filename}"
+
+    def _save_data_uri(m):
+        mime = (m.group(1) or "").lower()
+        data = m.group(2) or ""
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            return m.group(0)
+        return f'src="{_write_asset(raw, mime)}"'
+
+    html = re.sub(
+        r'src="data:([^;]+);base64,([^"]+)"',
+        _save_data_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html = re.sub(
+        r"src='data:([^;]+);base64,([^']+)'",
+        _save_data_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _save_svg_text_uri(m):
+        data = m.group(1) or ""
+        try:
+            raw_text = urllib.parse.unquote(data)
+            raw = raw_text.encode("utf-8")
+        except Exception:
+            return m.group(0)
+        return f'src="{_write_asset(raw, "image/svg+xml")}"'
+
+    html = re.sub(
+        r'src="data:image/svg\+xml(?:;charset=[^,;]+)?(?:;utf8)?,([^"]+)"',
+        _save_svg_text_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html = re.sub(
+        r"src='data:image/svg\+xml(?:;charset=[^,;]+)?(?:;utf8)?,([^']+)'",
+        _save_svg_text_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _save_css_uri(m):
+        mime = (m.group(1) or "").lower()
+        data = m.group(2) or ""
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            return m.group(0)
+        return f'url("{_write_asset(raw, mime)}")'
+
+    html = re.sub(
+        r'url\(\s*[\"\']?data:([^;]+);base64,([^\"\')]+)[\"\']?\s*\)',
+        _save_css_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    def _save_css_text_uri(m):
+        data = m.group(1) or ""
+        try:
+            raw_text = urllib.parse.unquote(data)
+            raw = raw_text.encode("utf-8")
+        except Exception:
+            return m.group(0)
+        return f'url("{_write_asset(raw, "image/svg+xml")}")'
+
+    html = re.sub(
+        r'url\(\s*[\"\']?data:image/svg\+xml(?:;charset=[^,;]+)?(?:;utf8)?,([^\"\')]+)[\"\']?\s*\)',
+        _save_css_text_uri,
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    return html
+
+
+
 @app.get("/")
 def root():
     return {"message": "Kriti backend running"}
@@ -263,6 +372,7 @@ def convert_design(req: ConvertRequest):
 
                     time.sleep(4)
                     code = generate_code(screen_layout, framework, route_layout=layout)
+                    code = _extract_data_uris(code, out_dir, public_assets=False)
 
                     with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as f:
                         f.write(code)
@@ -281,6 +391,7 @@ def convert_design(req: ConvertRequest):
             # 3. Inject AI files
             for path, content in ui_files.items():
                 path = path.replace("FILE:", "").strip()
+                content = _extract_data_uris(content, out_dir, public_assets=True)
                 full = os.path.join(out_dir, path)
                 os.makedirs(os.path.dirname(full), exist_ok=True)
                 with open(full, "w", encoding="utf-8") as f:

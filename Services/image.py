@@ -13,6 +13,7 @@ FIGMA_TOKEN = os.getenv("FIGMA_TOKEN")
 FIGMA_IMAGE_MAX_RETRIES = int(os.getenv("FIGMA_IMAGE_MAX_RETRIES", "2"))
 FIGMA_IMAGE_RETRY_BACKOFF = float(os.getenv("FIGMA_IMAGE_RETRY_BACKOFF", "2"))
 FIGMA_IMAGE_COOLDOWN_SECONDS = int(os.getenv("FIGMA_IMAGE_COOLDOWN_SECONDS", "60"))
+FIGMA_VECTOR_RENDER_MAX = int(os.getenv("FIGMA_VECTOR_RENDER_MAX", "256"))
 
 HEADERS = {
     "X-Figma-Token": FIGMA_TOKEN
@@ -86,6 +87,60 @@ RENDERABLE_IMAGE_TYPES = {
     "LINE",
     "POLYGON"
 }
+
+VECTOR_RENDER_TYPES = {
+    "VECTOR",
+    "BOOLEAN_OPERATION",
+    "LINE",
+    "POLYGON",
+    "STAR",
+}
+
+VECTOR_CONTAINER_TYPES = {
+    "GROUP",
+    "FRAME",
+    "INSTANCE",
+    "COMPONENT",
+}
+
+def _vector_bbox_ok(node) -> bool:
+    bb = node.get("absoluteBoundingBox") or {}
+    w = bb.get("width", 0)
+    h = bb.get("height", 0)
+    if not w or not h:
+        return False
+    return w <= FIGMA_VECTOR_RENDER_MAX and h <= FIGMA_VECTOR_RENDER_MAX
+
+def _is_vector_only(node) -> bool:
+    if not node:
+        return False
+    if node.get("type") == "TEXT":
+        return False
+    fills = node.get("fills") or []
+    if any(f.get("type") == "IMAGE" for f in fills):
+        return False
+    ntype = node.get("type")
+    if ntype in VECTOR_RENDER_TYPES:
+        return True
+    if ntype in VECTOR_CONTAINER_TYPES:
+        children = node.get("children") or []
+        if not children:
+            return False
+        return all(_is_vector_only(child) for child in children)
+    return False
+
+def extract_vector_render_nodes(node, vector_nodes=None):
+    if vector_nodes is None:
+        vector_nodes = []
+
+    if _is_vector_only(node) and _vector_bbox_ok(node):
+        vector_nodes.append(node["id"])
+        return vector_nodes
+
+    for child in node.get("children", []):
+        extract_vector_render_nodes(child, vector_nodes)
+
+    return vector_nodes
 
 def extract_image_node_ids(node, image_nodes=None):
     if image_nodes is None:
@@ -249,7 +304,8 @@ def build_image_ref_map(raw_figma_json: dict, file_key: str, base_path: str = "a
     image_nodes = extract_image_node_ids(document)
     instance_image_nodes = extract_instance_image_refs(document)
     logo_nodes = extract_logo_like_nodes(document)
-    all_image_nodes = list(set(image_nodes + instance_image_nodes + logo_nodes))
+    vector_render_nodes = extract_vector_render_nodes(document)
+    all_image_nodes = list(set(image_nodes + instance_image_nodes + logo_nodes + vector_render_nodes))
 
     node_id_to_ref = {}
     for node_id in all_image_nodes:

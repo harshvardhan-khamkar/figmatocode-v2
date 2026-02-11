@@ -34,11 +34,33 @@ def _sanitize_html_output(html: str) -> str:
     """
     Post-process model HTML to avoid invalid CSS and duplicate style blocks.
     - Remove any <style> blocks that are NOT type="text/tailwindcss"
-    - Normalize tracking classes like tracking-[-1_5px] to tracking-n1_5
+    - Normalize tracking classes like tracking-[-1_5px] to tracking-n1_5 when defined
     - Normalize non-standard spacing classes like gap-30 or pt-15 to bracketed px
     """
     if not html:
         return html
+
+    # Remove/repair malformed HTML comments that can swallow real markup.
+    # Example: "<!-- Main<div ...>" becomes "<div ...>"
+    html = re.sub(r"<!--\s*[^<]*<", "<", html)
+    # Strip any remaining HTML comments
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+
+    # Fix stray 'html' tokens inside arbitrary value classes
+    html = re.sub(r"(text|leading|tracking)-\[([0-9.\-]+)px\s*html", r"\1-[\2px]", html)
+
+    def _extract_defined_classes(content: str) -> set[str]:
+        defined = set()
+        for style in re.findall(
+            r"<style[^>]*type=[\"']text/tailwindcss[\"'][^>]*>(.*?)</style>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            for m in re.finditer(r"\.([a-zA-Z0-9_\\\-\[\]\.]+)\s*\{", style):
+                name = m.group(1)
+                defined.add(name)
+                defined.add(name.replace("\\", ""))
+        return defined
 
     # Remove stray leading tokens like "html" before the doctype.
     html = re.sub(r"^\s*html\s+(?=<!DOCTYPE html>)", "", html, flags=re.IGNORECASE)
@@ -79,15 +101,51 @@ def _sanitize_html_output(html: str) -> str:
         "32", "36", "40", "44", "48", "52", "56", "60", "64", "72", "80", "96"
     }
 
+    defined_classes = _extract_defined_classes(html)
+
+    def _normalize_dash_decimal(value: str) -> str:
+        if re.match(r"^\d+-\d+$", value):
+            left, right = value.split("-", 1)
+            return f"{left}.{right}"
+        return value
+
+    def _alias_custom_color(token: str) -> str:
+        if token in defined_classes:
+            return token
+        m = re.match(r"^(text|bg|border)-custom-([a-zA-Z0-9\-]+)$", token)
+        if not m:
+            return token
+        prefix, name = m.group(1), m.group(2)
+        # Try gray/grey swap if only one exists
+        if "gray" in name:
+            alt = name.replace("gray", "grey")
+            candidate = f"{prefix}-custom-{alt}"
+            if candidate in defined_classes:
+                return candidate
+        if "grey" in name:
+            alt = name.replace("grey", "gray")
+            candidate = f"{prefix}-custom-{alt}"
+            if candidate in defined_classes:
+                return candidate
+        # Try dropping -dark/-light if base exists
+        base = re.sub(r"-(dark|light|lighter|medium)$", "", name)
+        if base != name:
+            candidate = f"{prefix}-custom-{base}"
+            if candidate in defined_classes:
+                return candidate
+        return token
+
     def _replace_spacing_token(token: str) -> str:
         # Convert spacing tokens not in default scale to bracketed px.
         # Examples: gap-30 -> gap-[30px], pt-15 -> pt-[15px], space-x-27 -> space-x-[27px]
-        m = re.match(r"^(gap|p[trblxy]?|m[trblxy]?|space-[xy])-(\d+(?:\.\d+)?)$", token)
+        if token in defined_classes:
+            return token
+        m = re.match(r"^(gap|p[trblxy]?|m[trblxy]?|space-[xy])-(\d+(?:-\d+)?(?:\.\d+)?)$", token)
         if not m:
             return token
-        prefix, value = m.group(1), m.group(2)
-        if value in VALID_SPACING_SCALE:
-            return token
+        prefix = m.group(1)
+        raw_value = m.group(2)
+        value = _normalize_dash_decimal(raw_value)
         return f"{prefix}-[{value}px]"
 
     def _fix_padding_margin_prefixes(token: str) -> str:
@@ -95,6 +153,30 @@ def _sanitize_html_output(html: str) -> str:
         token = re.sub(r"^(p)-([trblxy])-", r"\1\2-", token)
         token = re.sub(r"^(m)-([trblxy])-", r"\1\2-", token)
         return token
+
+    def _normalize_px_suffix(token: str) -> str:
+        if token in defined_classes:
+            return token
+        neg = token.startswith("-")
+        core = token[1:] if neg else token
+        prefixes = (
+            "gap", "space-x", "space-y",
+            "p", "pt", "pr", "pb", "pl", "px", "py",
+            "m", "mt", "mr", "mb", "ml", "mx", "my",
+            "w", "h", "min-w", "max-w", "min-h", "max-h",
+            "top", "right", "bottom", "left", "inset", "inset-x", "inset-y",
+            "translate-x", "translate-y",
+            "rounded", "rounded-t", "rounded-b", "rounded-l", "rounded-r",
+            "rounded-tl", "rounded-tr", "rounded-bl", "rounded-br",
+        )
+        prefix_group = "|".join(re.escape(p) for p in prefixes)
+        m = re.match(rf"^({prefix_group})-(\d+(?:\.\d+)?)px$", core)
+        if not m:
+            return token
+        prefix, value = m.group(1), m.group(2)
+        converted = f"{prefix}-[{value}px]"
+        return f"-{converted}" if neg else converted
+
 
     # Normalize tracking class tokens in class=""
     def _replace_tracking_token(token: str) -> str:
@@ -105,41 +187,116 @@ def _sanitize_html_output(html: str) -> str:
         val = m.group(1)
         prefix = "n" if val.startswith("-") else "p"
         cleaned = val.lstrip("+-").replace(".", "_")
-        return f"tracking-{prefix}{cleaned}"
+        candidate = f"tracking-{prefix}{cleaned}"
+        if candidate in defined_classes:
+            return candidate
+        return token
+
+    def _normalize_text_leading_numeric(token: str) -> str:
+        if token in defined_classes:
+            return token
+        m = re.match(r"^(text|leading)-(\d+(?:-\d+)?(?:\.\d+)?)$", token)
+        if not m:
+            return token
+        prefix = m.group(1)
+        value = _normalize_dash_decimal(m.group(2))
+        return f"{prefix}-[{value}px]"
+
+    def _normalize_tracking_alias(token: str) -> str:
+        if token in defined_classes:
+            return token
+        m = re.match(r"^tracking-(neg-)?([np])?(-)?(\d+(?:[_-]\d+)?)$", token)
+        if not m:
+            return token
+        neg = bool(m.group(1)) or bool(m.group(3)) or (m.group(2) == "n")
+        val = m.group(4).replace("_", ".")
+        val = _normalize_dash_decimal(val)
+        sign = "-" if neg else ""
+        return f"tracking-[{sign}{val}px]"
+
+    def _normalize_numeric_token(token: str) -> str:
+        if token in defined_classes:
+            return token
+        neg = token.startswith("-")
+        core = token[1:] if neg else token
+        if "[" in core or "/" in core:
+            return token
+        prefixes = (
+            "w", "h", "min-w", "max-w", "min-h", "max-h",
+            "top", "right", "bottom", "left", "inset", "inset-x", "inset-y",
+            "translate-x", "translate-y",
+            "rounded", "rounded-t", "rounded-b", "rounded-l", "rounded-r",
+            "rounded-tl", "rounded-tr", "rounded-bl", "rounded-br",
+        )
+        prefix_group = "|".join(re.escape(p) for p in prefixes)
+        m = re.match(rf"^({prefix_group})-(\d+(?:-\d+)?(?:\.\d+)?)$", core)
+        if not m:
+            return token
+        prefix, value = m.group(1), _normalize_dash_decimal(m.group(2))
+        converted = f"{prefix}-[{value}px]"
+        return f"-{converted}" if neg else converted
 
     def _replace_class_attr(match):
         classes = match.group(1)
         tokens = classes.split()
-        tokens = [
-            _fix_padding_margin_prefixes(
-                _replace_spacing_token(_replace_tracking_token(t))
-            )
-            for t in tokens
-        ]
+        normalized = []
+        for t in tokens:
+            if t == "html":
+                continue
+            t = t.replace("\\.", ".")
+            t = _replace_tracking_token(t)
+            t = _replace_spacing_token(t)
+            t = _fix_padding_margin_prefixes(t)
+            t = _normalize_px_suffix(t)
+            t = _alias_custom_color(t)
+            t = _normalize_text_leading_numeric(t)
+            t = _normalize_tracking_alias(t)
+            t = _normalize_numeric_token(t)
+            normalized.append(t)
+        tokens = normalized
         # Normalize model-generated prefixes like leading-line-height-* -> line-height-*
         # and tracking-letter-spacing-* -> letter-spacing-*
-        tokens = [
-            re.sub(r"^leading-line-height-", "line-height-", t)
-            for t in tokens
-        ]
-        tokens = [
-            re.sub(r"^tracking-letter-spacing-", "letter-spacing-", t)
-            for t in tokens
-        ]
+        tokens = [re.sub(r"^leading-line-height-", "line-height-", t) for t in tokens]
+        tokens = [re.sub(r"^tracking-letter-spacing-", "letter-spacing-", t) for t in tokens]
         return f'class="{" ".join(tokens)}"'
 
     html = re.sub(r'class="([^"]+)"', _replace_class_attr, html)
 
-    # Normalize tracking selectors inside CSS
+    # Normalize tracking selectors inside CSS when a normalized class exists
     def _replace_tracking_selector(match):
         val = match.group(1)
         prefix = "n" if val.startswith("-") else "p"
         cleaned = val.lstrip("+-").replace(".", "_")
-        return f".tracking-{prefix}{cleaned}"
+        candidate = f"tracking-{prefix}{cleaned}"
+        if candidate in defined_classes:
+            return f".{candidate}"
+        return match.group(0)
 
     html = re.sub(r"\.tracking-\[([+-]?[\d_\.]+)px\]", _replace_tracking_selector, html)
+    # Fix malformed tracking class selectors like ".tracking-.tracking-custom-tight-3\.2"
+    html = html.replace(".tracking-.tracking-", ".tracking-")
+
+    # If a container uses overflow-hidden but has absolutely-positioned children
+    # with negative offsets, remove overflow-hidden to allow intentional overlap.
+    def _relax_overflow_hidden(match):
+        classes = match.group(1)
+        tail = match.group(2)
+        if "clip-true" in classes or "clip-content" in classes:
+            return f'<div class="{classes}">{tail}'
+        if re.search(r"\babsolute\b", tail) and re.search(r"(?:top|left|right|bottom)-\[-|-(?:top|left|right|bottom)-\[", tail):
+            classes = re.sub(r"\boverflow-hidden\b", "", classes).strip()
+            classes = re.sub(r"\s{2,}", " ", classes)
+        return f'<div class="{classes}">{tail}'
+
+    html = re.sub(
+        r'<div class="([^"]*\boverflow-hidden\b[^"]*)">(.{0,8000})',
+        _relax_overflow_hidden,
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
     return html
+
 
 def _ensure_custom_class(html: str, class_name: str, css_body: str) -> str:
     if not html or class_name not in html:
@@ -154,6 +311,67 @@ def _ensure_custom_class(html: str, class_name: str, css_body: str) -> str:
         "}\n"
         "</style>"
     )
+    if "</head>" in html.lower():
+        return re.sub(r"(</head>)", style_block + "\n\\1", html, count=1, flags=re.IGNORECASE)
+    return html + "\n" + style_block
+
+def _ensure_missing_color_utilities(html: str) -> str:
+    if not html:
+        return html
+
+    def _extract_defined_classes(content: str) -> set[str]:
+        defined = set()
+        for style in re.findall(
+            r"<style[^>]*type=[\"']text/tailwindcss[\"'][^>]*>(.*?)</style>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            for m in re.finditer(r"\.([a-zA-Z0-9_\\\-\[\]\.]+)\s*\{", style):
+                name = m.group(1)
+                defined.add(name)
+                defined.add(name.replace("\\", ""))
+        return defined
+
+    defined_classes = _extract_defined_classes(html)
+    matches = re.findall(r"\b(text|bg|border)-custom-([0-9a-fA-F]{3,8})\b", html)
+    if not matches:
+        return html
+
+    def _hex_to_color(hex_value: str) -> str:
+        hex_value = hex_value.lower()
+        if len(hex_value) == 3:
+            hex_value = "".join([c * 2 for c in hex_value])
+        if len(hex_value) == 6:
+            return f"#{hex_value}"
+        if len(hex_value) == 8:
+            r = int(hex_value[0:2], 16)
+            g = int(hex_value[2:4], 16)
+            b = int(hex_value[4:6], 16)
+            a = int(hex_value[6:8], 16) / 255
+            return f"rgba({r}, {g}, {b}, {a:.3f})".rstrip("0").rstrip(".")
+        return f"#{hex_value}"
+
+    rules = []
+    seen = set()
+    for kind, hex_value in matches:
+        class_name = f"{kind}-custom-{hex_value}"
+        if class_name in defined_classes or class_name in seen:
+            continue
+        seen.add(class_name)
+        color_value = _hex_to_color(hex_value)
+        prop = "color" if kind == "text" else "background-color" if kind == "bg" else "border-color"
+        rules.append(f"  .{class_name} {{ {prop}: {color_value}; }}")
+
+    if not rules:
+        return html
+
+    style_block = (
+        "<style type=\"text/tailwindcss\">\n"
+        "@layer utilities {\n"
+        + "\n".join(rules) +
+        "\n}\n</style>"
+    )
+
     if "</head>" in html.lower():
         return re.sub(r"(</head>)", style_block + "\n\\1", html, count=1, flags=re.IGNORECASE)
     return html + "\n" + style_block
@@ -420,10 +638,7 @@ def _apply_image_meta(html: str, layout: dict) -> str:
         src = match.group(1)
         scale = scale_map.get(src)
         radius = radius_map.get(src)
-        if scale is None and radius is None:
-            return full
-
-        desired = _desired_object(scale, src)
+        desired = _desired_object(scale, src) if scale is not None else "object-contain"
 
         class_match = re.search(r'class="([^"]*)"', full)
         if class_match:
@@ -440,13 +655,11 @@ def _apply_image_meta(html: str, layout: dict) -> str:
                     classes.append(radius_px)
             new_class = " ".join(classes)
             return re.sub(r'class="[^"]*"', f'class="{new_class}"', full)
-        else:
-            extra = desired
-            if radius is not None:
-                extra += f" rounded-[{radius}px]"
-            return full.replace("<img ", f'<img class="{extra}" ', 1)
 
-        return re.sub(r"<img[^>]+src=\"([^\"]+)\"[^>]*>", _replace_img, html)
+        extra = desired
+        if radius is not None:
+            extra += f" rounded-[{radius}px]"
+        return full.replace("<img ", f'<img class="{extra}" ', 1)
 
     def _unclip_wrappers(match):
         classes = match.group(1)
@@ -457,6 +670,13 @@ def _apply_image_meta(html: str, layout: dict) -> str:
         classes = re.sub(r"\\boverflow-hidden\\b", "", classes).strip()
         classes = re.sub(r"\\s{2,}", " ", classes)
         return f'<div class="{classes}"><img src="{src}"'
+
+    html = re.sub(
+        r"<img[^>]+src=\"([^\"]+)\"[^>]*>",
+        _replace_img,
+        html,
+        flags=re.IGNORECASE,
+    )
 
     html = re.sub(
         r'<div class="([^"]*)">\\s*<img src="([^"]+)"',
@@ -708,6 +928,9 @@ RULES:
     If a node has style.radius and contains an image (style.image == true),
     apply the radius and `overflow-hidden` on the image wrapper, and apply the
     same rounded class to the <img>.
+15.1 CLIPPING (CRITICAL):
+    If style.clips == true, add overflow-hidden and also add class "clip-true".
+    If style.clips is false or missing, do NOT add overflow-hidden just because of radius.
 
 IMAGE RULE (CRITICAL):
 If style.image == true AND style.imageUrl exists ->
@@ -715,6 +938,9 @@ If style.image == true AND style.imageUrl exists ->
 
 If style.image == true but style.imageUrl is missing ->
 <img src="https://placehold.co/600x400?text=Image" />
+
+NEVER embed base64/data: URIs or inline SVG in src or CSS.
+If no imageUrl is provided, use the placeholder above.
 
 IMAGE ASPECT RATIO (IMPORTANT):
 If style.imageScale is "FILL" -> use `object-cover`.
@@ -836,6 +1062,9 @@ UI RULES
   If a node has style.radius and contains an image (style.image == true),
   apply the radius and `overflow-hidden` on the image wrapper, and apply the
   same rounded class to the <img>.
+- CLIPPING (CRITICAL):
+  If style.clips == true, add overflow-hidden and also add class "clip-true".
+  If style.clips is false or missing, do NOT add overflow-hidden just because of radius.
 
 IMAGE RULE (CRITICAL):
 If style.image == true AND style.imageUrl exists ->
@@ -853,6 +1082,7 @@ Use free public CDNs for logos/icons if no imageUrl is provided:
 jsDelivr, Unpkg, Icons8, SimpleIcons.
 
 Never generate image files.
+Never embed base64/data: URIs or inline SVG.
 
 Fonts:
 - Use fontFamily from the Figma layout
@@ -911,7 +1141,9 @@ def generate_code(layout: dict, framework: str, route_layout: dict | None = None
                     raise Exception("AI did not return HTML")
                 if "</html>" in text.lower():
                     routing_layout = route_layout or layout
-                    html = _apply_image_meta(_inject_google_fonts(_sanitize_html_output(text), layout), layout)
+                    html = _sanitize_html_output(text)
+                    html = _ensure_missing_color_utilities(html)
+                    html = _apply_image_meta(_inject_google_fonts(html, layout), layout)
                     html = _ensure_custom_class(html, "text-custom-ffffff", "color: #ffffff;")
                     html = _convert_nav_to_links(html, routing_layout)
                     return html
@@ -938,7 +1170,9 @@ def generate_code(layout: dict, framework: str, route_layout: dict | None = None
                     partial += cont_text
                     if "</html>" in partial.lower():
                         routing_layout = route_layout or layout
-                        html = _apply_image_meta(_inject_google_fonts(_sanitize_html_output(partial), layout), layout)
+                        html = _sanitize_html_output(partial)
+                        html = _ensure_missing_color_utilities(html)
+                        html = _apply_image_meta(_inject_google_fonts(html, layout), layout)
                         html = _ensure_custom_class(html, "text-custom-ffffff", "color: #ffffff;")
                         html = _convert_nav_to_links(html, routing_layout)
                         return html

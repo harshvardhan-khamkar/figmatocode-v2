@@ -206,6 +206,8 @@ def extract_node(node, parent_x=0, parent_y=0):
 
     out["style"].update(parse_fills(node, node.get("fills")))
 
+    if node.get("clipsContent") is True:
+        out["style"]["clips"] = True
 
     # ===============================
     # BORDERS
